@@ -272,6 +272,7 @@ impl<P: Preset> Network<P> {
                 .execution_payload_timeout(chain_config.slot_duration_ms)
                 .payload_attestation_message_timeout(chain_config.slot_duration_ms)
                 .proposer_preferences_timeout(half_epoch)
+                // .execution_proof_timeout(timeout) // Do not retry
                 .build()
         };
 
@@ -316,7 +317,7 @@ impl<P: Preset> Network<P> {
             let all_topics_for_forks = current_and_future_forks
                 .map(|(fork_epoch, fork_digest)| {
                     let phase = ctx.chain_config.phase_at_epoch(fork_epoch);
-                    all_topics_at_fork(&chain_config, phase)
+                    all_topics_at_fork(&chain_config, phase, config.enable_execution_proof)
                         .into_iter()
                         .map(|topic| {
                             GossipTopic::new(topic, GossipEncoding::default(), fork_digest)
@@ -341,6 +342,7 @@ impl<P: Preset> Network<P> {
                     &chain_config,
                     AttestationSubnetCount::U64,
                     SyncCommitteeSubnetCount::U64,
+                    config.enable_execution_proof,
                 ),
                 // during a fork we subscribe to both the old and new topics
                 max_subscribed_topics: max_topics_at_any_fork * 4,

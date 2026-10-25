@@ -321,6 +321,7 @@ pub(crate) fn create_whitelist_filter(
     chain_config: &ChainConfig,
     attestation_subnet_count: u64,
     sync_committee_subnet_count: u64,
+    enable_execution_proof: bool,
 ) -> gossipsub::WhitelistSubscriptionFilter {
     let mut possible_hashes = HashSet::new();
     for fork_digest in possible_fork_digests {
@@ -353,6 +354,9 @@ pub(crate) fn create_whitelist_filter(
         add(ExecutionPayload);
         add(PayloadAttestationMessage);
         add(ProposerPreferences);
+        if enable_execution_proof {
+            add(ExecutionProof);
+        }
     }
     gossipsub::WhitelistSubscriptionFilter(possible_hashes)
 }
@@ -383,6 +387,44 @@ pub(crate) fn save_metadata_to_disk(dir: Option<&Path>, metadata: MetaData) {
                 error = %e,
                 "Could not write metadata to disk"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use libp2p::gossipsub::TopicSubscriptionFilter as _;
+    use typenum::Unsigned as _;
+    use types::{
+        altair::consts::SyncCommitteeSubnetCount, phase0::consts::AttestationSubnetCount,
+        phase0::primitives::H32,
+    };
+
+    use super::*;
+
+    #[test]
+    fn whitelist_contains_execution_proof_only_when_enabled() {
+        let chain_config = ChainConfig::mainnet();
+        let fork_digests = [H32([1, 2, 3, 4]), H32([5, 6, 7, 8])];
+
+        for enable_execution_proof in [false, true] {
+            let mut filter = create_whitelist_filter(
+                fork_digests.to_vec(),
+                &chain_config,
+                AttestationSubnetCount::U64,
+                SyncCommitteeSubnetCount::U64,
+                enable_execution_proof,
+            );
+
+            for fork_digest in fork_digests {
+                let topic: gossipsub::IdentTopic = GossipTopic::new(
+                    GossipKind::ExecutionProof,
+                    GossipEncoding::SSZSnappy,
+                    fork_digest,
+                )
+                .into();
+                assert_eq!(filter.can_subscribe(&topic.hash()), enable_execution_proof);
+            }
         }
     }
 }

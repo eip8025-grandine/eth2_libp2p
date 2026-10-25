@@ -74,6 +74,14 @@ pub async fn build_libp2p_instance<P: Preset>(
     fork_name: Phase,
 ) -> Libp2pInstance<P> {
     let config = build_config(boot_nodes, disable_peer_scoring, inbound_rate_limiter);
+    build_libp2p_instance_with_config(chain_config, config, fork_name).await
+}
+
+pub async fn build_libp2p_instance_with_config<P: Preset>(
+    chain_config: &Arc<ChainConfig>,
+    config: Arc<NetworkConfig>,
+    fork_name: Phase,
+) -> Libp2pInstance<P> {
     // launch libp2p service
 
     let (shutdown_tx, _) = futures::channel::mpsc::channel(1);
@@ -122,24 +130,31 @@ pub async fn build_node_pair<P: Preset>(
     disable_peer_scoring: bool,
     inbound_rate_limiter: Option<InboundRateLimiterConfig>,
 ) -> (Libp2pInstance<P>, Libp2pInstance<P>) {
-    let mut sender = build_libp2p_instance::<P>(
+    let sender_config = build_config(vec![], disable_peer_scoring, inbound_rate_limiter.clone());
+    let receiver_config = build_config(vec![], disable_peer_scoring, inbound_rate_limiter);
+    build_node_pair_with_configs(
         chain_config,
-        vec![],
-        "sender".to_string(),
-        disable_peer_scoring,
-        inbound_rate_limiter.clone(),
         fork_name,
+        protocol,
+        sender_config,
+        receiver_config,
     )
-    .await;
-    let mut receiver = build_libp2p_instance::<P>(
-        chain_config,
-        vec![],
-        "receiver".to_string(),
-        disable_peer_scoring,
-        inbound_rate_limiter,
-        fork_name,
-    )
-    .await;
+    .await
+}
+
+// Like `build_node_pair`, but with a separate network config for each node.
+#[allow(dead_code)]
+pub async fn build_node_pair_with_configs<P: Preset>(
+    chain_config: &Arc<ChainConfig>,
+    fork_name: Phase,
+    protocol: Protocol,
+    sender_config: Arc<NetworkConfig>,
+    receiver_config: Arc<NetworkConfig>,
+) -> (Libp2pInstance<P>, Libp2pInstance<P>) {
+    let mut sender =
+        build_libp2p_instance_with_config::<P>(chain_config, sender_config, fork_name).await;
+    let mut receiver =
+        build_libp2p_instance_with_config::<P>(chain_config, receiver_config, fork_name).await;
 
     // let the two nodes set up listeners
     let sender_fut = async {

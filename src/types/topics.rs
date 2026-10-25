@@ -37,6 +37,7 @@ pub const EXECUTION_PAYLOAD_BID_TOPIC: &str = "execution_payload_bid";
 pub const EXECUTION_PAYLOAD_TOPIC: &str = "execution_payload";
 pub const PAYLOAD_ATTESTATION_MESSAGE_TOPIC: &str = "payload_attestation_message";
 pub const PROPOSER_PREFERENCES_TOPIC: &str = "proposer_preferences";
+pub const EXECUTION_PROOF_TOPIC: &str = "execution_proof";
 
 #[derive(Debug)]
 pub struct TopicConfig {
@@ -44,6 +45,7 @@ pub struct TopicConfig {
     pub subscribe_all_subnets: bool,
     pub subscribe_all_data_column_subnets: bool,
     pub sampling_subnets: HashSet<SubnetId>,
+    pub enable_execution_proof: bool,
 }
 
 /// Returns all the topics the node should subscribe at `current_phase`
@@ -102,6 +104,10 @@ pub fn core_topics_to_subscribe(
         topics.push(GossipKind::ExecutionPayload);
         topics.push(GossipKind::PayloadAttestationMessage);
         topics.push(GossipKind::ProposerPreferences);
+
+        if opts.enable_execution_proof {
+            topics.push(GossipKind::ExecutionProof);
+        }
     }
 
     topics
@@ -131,11 +137,18 @@ pub fn is_fork_non_core_topic(topic: &GossipTopic, _phase: Phase) -> bool {
         | GossipKind::ExecutionPayloadBid
         | GossipKind::ExecutionPayload
         | GossipKind::PayloadAttestationMessage
-        | GossipKind::ProposerPreferences => false,
+        | GossipKind::ProposerPreferences
+        | GossipKind::ExecutionProof => false,
     }
 }
 
-pub fn all_topics_at_fork(chain_config: &ChainConfig, current_phase: Phase) -> Vec<GossipKind> {
+/// `enable_execution_proof` is passed through rather than assumed, so that a node that has not
+/// opted in keeps its current topic count limits.
+pub fn all_topics_at_fork(
+    chain_config: &ChainConfig,
+    current_phase: Phase,
+    enable_execution_proof: bool,
+) -> Vec<GossipKind> {
     // Compute the worst case of all forks
     let sampling_subnets = HashSet::from_iter(0..chain_config.data_column_sidecar_subnet_count);
     let opts = TopicConfig {
@@ -143,6 +156,7 @@ pub fn all_topics_at_fork(chain_config: &ChainConfig, current_phase: Phase) -> V
         subscribe_all_subnets: true,
         subscribe_all_data_column_subnets: true,
         sampling_subnets,
+        enable_execution_proof,
     };
     core_topics_to_subscribe(chain_config, current_phase, &opts)
 }
@@ -198,6 +212,8 @@ pub enum GossipKind {
     PayloadAttestationMessage,
     /// Topic for publishing proposer preferences.
     ProposerPreferences,
+    /// Topic for publishing signed execution proof envelopes.
+    ExecutionProof,
 }
 
 impl std::fmt::Display for GossipKind {
@@ -280,6 +296,7 @@ impl GossipTopic {
                 EXECUTION_PAYLOAD_TOPIC => GossipKind::ExecutionPayload,
                 PAYLOAD_ATTESTATION_MESSAGE_TOPIC => GossipKind::PayloadAttestationMessage,
                 PROPOSER_PREFERENCES_TOPIC => GossipKind::ProposerPreferences,
+                EXECUTION_PROOF_TOPIC => GossipKind::ExecutionProof,
                 topic => match subnet_topic_index(topic) {
                     Some(kind) => kind,
                     None => return Err(format!("Unknown topic: {}", topic)),
@@ -348,6 +365,7 @@ impl std::fmt::Display for GossipTopic {
             GossipKind::ExecutionPayload => EXECUTION_PAYLOAD_TOPIC.into(),
             GossipKind::PayloadAttestationMessage => PAYLOAD_ATTESTATION_MESSAGE_TOPIC.into(),
             GossipKind::ProposerPreferences => PROPOSER_PREFERENCES_TOPIC.into(),
+            GossipKind::ExecutionProof => EXECUTION_PROOF_TOPIC.into(),
         };
         write!(
             f,
@@ -422,6 +440,7 @@ mod tests {
                 ExecutionPayload,
                 PayloadAttestationMessage,
                 ProposerPreferences,
+                ExecutionProof,
             ]
             .iter()
             {
@@ -525,6 +544,7 @@ mod tests {
             PayloadAttestationMessage.as_ref()
         );
         assert_eq!("proposer_preferences", ProposerPreferences.as_ref());
+        assert_eq!("execution_proof", ExecutionProof.as_ref());
     }
 
     fn get_chain_config() -> ChainConfig {
@@ -549,6 +569,7 @@ mod tests {
             subscribe_all_subnets: false,
             subscribe_all_data_column_subnets: false,
             sampling_subnets,
+            enable_execution_proof: false,
         }
     }
 
@@ -611,6 +632,50 @@ mod tests {
                 "Should contain {:?}",
                 expected_topic,
             );
+        }
+    }
+
+    #[test]
+    fn execution_proof_topic_string() {
+        let topic = GossipTopic::new(ExecutionProof, GossipEncoding::SSZSnappy, H32([1, 2, 3, 4]));
+        assert_eq!(
+            String::from(topic),
+            "/eth2/01020304/execution_proof/ssz_snappy"
+        );
+    }
+
+    #[test]
+    fn execution_proof_is_subscribed_from_gloas_when_enabled() {
+        let config = get_chain_config();
+        let mut topic_config = get_topic_config(get_sampling_subnets());
+        topic_config.enable_execution_proof = true;
+        for phase in enum_iterator::all::<Phase>() {
+            assert_eq!(
+                core_topics_to_subscribe(&config, phase, &topic_config).contains(&ExecutionProof),
+                phase >= Phase::Gloas,
+                "{phase:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn execution_proof_is_not_subscribed_when_disabled() {
+        let config = get_chain_config();
+        let topic_config = get_topic_config(get_sampling_subnets());
+        for phase in enum_iterator::all::<Phase>() {
+            assert!(
+                !core_topics_to_subscribe(&config, phase, &topic_config).contains(&ExecutionProof),
+                "{phase:?}",
+            );
+            assert!(!all_topics_at_fork(&config, phase, false).contains(&ExecutionProof));
+        }
+    }
+
+    #[test]
+    fn execution_proof_is_not_fork_non_core_topic() {
+        let topic = GossipTopic::new(ExecutionProof, GossipEncoding::SSZSnappy, H32([1, 2, 3, 4]));
+        for phase in enum_iterator::all::<Phase>() {
+            assert!(!is_fork_non_core_topic(&topic, phase));
         }
     }
 }
