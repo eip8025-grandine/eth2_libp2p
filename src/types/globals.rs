@@ -244,6 +244,7 @@ impl NetworkGlobals {
                 .network_config
                 .subscribe_all_data_column_subnets,
             sampling_subnets: self.sampling_subnets.read().clone(),
+            enable_execution_proof: self.network_config.enable_execution_proof,
         }
     }
 

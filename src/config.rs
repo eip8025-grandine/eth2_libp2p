@@ -134,6 +134,9 @@ pub struct Config {
     /// Whether light client protocols should be enabled.
     pub enable_light_client_server: bool,
 
+    /// Whether to subscribe to and accept the EIP-8025 `execution_proof` gossip topic.
+    pub enable_execution_proof: bool,
+
     /// Whether to enable the mplex multiplexer alongside yamux. Enabled by default.
     pub enable_mplex: bool,
 
@@ -362,6 +365,7 @@ impl Default for Config {
             proposer_only: false,
             metrics_enabled: false,
             enable_light_client_server: false,
+            enable_execution_proof: false,
             enable_mplex: true,
             outbound_rate_limiter_config: None,
             invalid_block_storage: None,

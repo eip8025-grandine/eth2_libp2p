@@ -21,6 +21,9 @@ use types::{
         LightClientOptimisticUpdate, SignedAggregateAndProof, SignedBeaconBlock,
     },
     deneb::containers::SignedBeaconBlock as DenebBeaconBlock,
+    eip8025::{
+        consts::MAX_SIGNED_EXECUTION_PROOF_ENVELOPE_SIZE, containers::SignedExecutionProofEnvelope,
+    },
     electra::containers::{
         AttesterSlashing as ElectraAttesterSlashing,
         SignedAggregateAndProof as ElectraSignedAggregateAndProof,
@@ -84,6 +87,8 @@ pub enum PubsubMessage<P: Preset> {
     PayloadAttestationMessage(Arc<PayloadAttestationMessage>),
     /// Gossipsub message providing notification of a proposer preference.
     ProposerPreferences(Arc<SignedProposerPreferences>),
+    /// Gossipsub message providing notification of a signed execution proof envelope.
+    ExecutionProof(Arc<SignedExecutionProofEnvelope>),
 }
 
 // Implements the `DataTransform` trait of gossipsub to employ snappy compression
@@ -184,6 +189,7 @@ impl<P: Preset> PubsubMessage<P> {
             PubsubMessage::ExecutionPayload(_) => GossipKind::ExecutionPayload,
             PubsubMessage::PayloadAttestationMessage(_) => GossipKind::PayloadAttestationMessage,
             PubsubMessage::ProposerPreferences(_) => GossipKind::ProposerPreferences,
+            PubsubMessage::ExecutionProof(_) => GossipKind::ExecutionProof,
         }
     }
 
@@ -662,6 +668,37 @@ impl<P: Preset> PubsubMessage<P> {
                             )),
                         }
                     }
+                    GossipKind::ExecutionProof => {
+                        match fork_context.get_fork_from_context_bytes(gossip_topic.fork_digest) {
+                            Some(Phase::Gloas) => {
+                                ensure_max_message_size(
+                                    "SignedExecutionProofEnvelope",
+                                    "MAX_SIGNED_EXECUTION_PROOF_ENVELOPE_SIZE",
+                                    data,
+                                    MAX_SIGNED_EXECUTION_PROOF_ENVELOPE_SIZE as u64,
+                                )?;
+
+                                let execution_proof = Arc::new(
+                                    SignedExecutionProofEnvelope::from_ssz_default(data)
+                                        .map_err(|e| format!("{:?}", e))?,
+                                );
+                                Ok(PubsubMessage::ExecutionProof(execution_proof))
+                            }
+                            Some(
+                                Phase::Phase0
+                                | Phase::Altair
+                                | Phase::Bellatrix
+                                | Phase::Capella
+                                | Phase::Deneb
+                                | Phase::Electra
+                                | Phase::Fulu,
+                            )
+                            | None => Err(format!(
+                                "execution_proof topic invalid for given fork digest {:?}",
+                                gossip_topic.fork_digest
+                            )),
+                        }
+                    }
                 }
             }
         }
@@ -692,6 +729,7 @@ impl<P: Preset> PubsubMessage<P> {
             PubsubMessage::ExecutionPayload(data) => data.to_ssz(),
             PubsubMessage::PayloadAttestationMessage(data) => data.to_ssz(),
             PubsubMessage::ProposerPreferences(data) => data.to_ssz(),
+            PubsubMessage::ExecutionProof(data) => data.to_ssz(),
         }
     }
 }
@@ -801,13 +839,30 @@ impl<P: Preset> std::fmt::Display for PubsubMessage<P> {
                     data.message.proposal_slot, data.message.validator_index,
                 )
             }
+            PubsubMessage::ExecutionProof(data) => {
+                write!(
+                    f,
+                    "Execution Proof: beacon_block_root: {:?}, proof_type: {}, validator_index: {}",
+                    data.message.beacon_block_root, data.message.proof_type, data.validator_index,
+                )
+            }
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use types::{config::Config as ChainConfig, preset::Mainnet};
+    use bls::SignatureBytes;
+    use ssz::Hc;
+    use types::{
+        config::Config as ChainConfig,
+        eip8025::{
+            consts::MAX_PROOF_SIZE,
+            containers::{ExecutionProofEnvelope, ProofData},
+        },
+        phase0::primitives::H256,
+        preset::Mainnet,
+    };
 
     use super::*;
 
@@ -870,5 +925,134 @@ mod tests {
             !err.contains("MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn gloas_execution_proof_size_bound() {
+        let max = MAX_SIGNED_EXECUTION_PROOF_ENVELOPE_SIZE;
+        let err = decode_oversized(GossipKind::ExecutionProof, max + 1).unwrap_err();
+        assert!(
+            err.contains("MAX_SIGNED_EXECUTION_PROOF_ENVELOPE_SIZE"),
+            "{err}"
+        );
+        let err = decode_oversized(GossipKind::ExecutionProof, max).unwrap_err();
+        assert!(
+            !err.contains("MAX_SIGNED_EXECUTION_PROOF_ENVELOPE_SIZE"),
+            "{err}"
+        );
+    }
+
+    // A fork context in which Fulu and Gloas have distinct digests.
+    fn execution_proof_fork_context() -> ForkContext {
+        let chain_config = Arc::new(ChainConfig::mainnet().rapid_upgrade());
+        ForkContext::dummy::<Mainnet>(&chain_config, Phase::Gloas)
+    }
+
+    fn execution_proof_topic(fork_digest: ForkDigest) -> TopicHash {
+        let topic = GossipTopic::new(
+            GossipKind::ExecutionProof,
+            GossipEncoding::default(),
+            fork_digest,
+        );
+        TopicHash::from_raw(String::from(topic))
+    }
+
+    // Deterministic xorshift output, so snappy cannot compress it.
+    fn incompressible_bytes(length: usize) -> Vec<u8> {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        (0..length)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state.to_le_bytes()[0]
+            })
+            .collect()
+    }
+
+    fn max_size_execution_proof() -> SignedExecutionProofEnvelope {
+        let proof_data = ProofData::try_from(incompressible_bytes(MAX_PROOF_SIZE))
+            .expect("proof data should be within bounds");
+
+        SignedExecutionProofEnvelope {
+            message: Hc::from(ExecutionProofEnvelope {
+                proof_data,
+                proof_type: 1,
+                beacon_block_root: H256::repeat_byte(0xab),
+            }),
+            validator_index: 42,
+            signature: SignatureBytes::default(),
+        }
+    }
+
+    #[test]
+    fn gloas_execution_proof_max_size_round_trip() {
+        let fork_context = execution_proof_fork_context();
+        let topic_hash = execution_proof_topic(fork_context.current_fork_digest());
+        let message =
+            PubsubMessage::<Mainnet>::ExecutionProof(Arc::new(max_size_execution_proof()));
+
+        let data = message
+            .encode(GossipEncoding::default())
+            .expect("envelope should encode");
+        assert_eq!(data.len(), MAX_SIGNED_EXECUTION_PROOF_ENVELOPE_SIZE);
+
+        let decoded = PubsubMessage::decode(&topic_hash, &data, &fork_context)
+            .expect("max-size envelope should decode");
+        assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn gloas_execution_proof_max_size_passes_snappy_transform() {
+        let fork_context = execution_proof_fork_context();
+        let chain_config = fork_context.chain_config();
+        let topic_hash = execution_proof_topic(fork_context.current_fork_digest());
+        let data = PubsubMessage::<Mainnet>::ExecutionProof(Arc::new(max_size_execution_proof()))
+            .encode(GossipEncoding::default())
+            .expect("envelope should encode");
+
+        let transform = SnappyTransform::new(
+            chain_config.max_payload_size,
+            chain_config.max_payload_size_compressed(),
+        );
+        let compressed = transform
+            .outbound_transform(&topic_hash, data.clone())
+            .expect("max-size envelope should compress within limits");
+        assert!(compressed.len() > data.len());
+        let message = transform
+            .inbound_transform(RawMessage {
+                source: None,
+                data: compressed,
+                sequence_number: None,
+                topic: topic_hash,
+                signature: None,
+                key: None,
+                validated: false,
+            })
+            .expect("max-size envelope should decompress within limits");
+
+        assert_eq!(message.data, data);
+    }
+
+    #[test]
+    fn execution_proof_is_rejected_before_gloas() {
+        let fork_context = execution_proof_fork_context();
+        let chain_config = fork_context.chain_config();
+        let fulu_digest = fork_context.context_bytes(chain_config.fulu_fork_epoch);
+        assert_eq!(
+            fork_context.get_fork_from_context_bytes(fulu_digest),
+            Some(Phase::Fulu)
+        );
+        let data = PubsubMessage::<Mainnet>::ExecutionProof(Arc::new(max_size_execution_proof()))
+            .encode(GossipEncoding::default())
+            .expect("envelope should encode");
+
+        let err = PubsubMessage::<Mainnet>::decode(
+            &execution_proof_topic(fulu_digest),
+            &data,
+            &fork_context,
+        )
+        .unwrap_err();
+        assert!(err.contains("execution_proof topic invalid"), "{err}");
     }
 }
